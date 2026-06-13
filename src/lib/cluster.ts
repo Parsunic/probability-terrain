@@ -42,6 +42,11 @@ const STOPWORDS = new Set([
   "one", "two", "even", "still", "never", "always", "often", "really", "actually", "something",
   "someone", "everything", "nothing", "anyone", "they're", "you're", "it's", "don't", "isn't",
   "into", "onto", "upon", "yet", "also", "every", "another", "around", "without", "within",
+  // contractions & weak fillers — never make good island names
+  "can't", "don't", "won't", "isn't", "aren't", "wasn't", "weren't", "didn't", "doesn't",
+  "couldn't", "wouldn't", "shouldn't", "hasn't", "haven't", "hadn't", "i'm", "i've", "i'd",
+  "i'll", "you're", "you've", "you'll", "we're", "we've", "we'll", "they're", "they've",
+  "that's", "there's", "here's", "what's", "let's", "who's", "it'll", "you'd", "they'd",
 ]);
 
 function tokenize(text: string): string[] {
@@ -75,11 +80,13 @@ export function clusterNodes(items: ClusterItem[]): ClusterResult {
   const n = items.length;
   if (n === 0) return { assignments: [], clusters: [] };
 
-  // If the notes carry curated topic tags (the bundled demo set), group by tag
-  // for clean, unique island names. User-pasted notes have no tags and fall
-  // through to genuine k-means discovery below.
-  const taggedCount = items.filter((it) => it.topic).length;
-  if (taggedCount >= n * 0.8 && new Set(items.map((it) => it.topic)).size <= PALETTE.length) {
+  // Whenever the terrain has a curated topic backbone (≥2 distinct tags), group
+  // by tag for clean island names; untagged notes added to it route to their
+  // nearest topic island (see clusterByTopic) — adding notes never tips the
+  // whole map into a k-means relayout, and a 9th topic doesn't break it.
+  // Fully-untagged sets (user-pasted notes) fall through to k-means discovery.
+  const taggedTopics = new Set(items.filter((it) => it.topic).map((it) => it.topic));
+  if (taggedTopics.size >= 2) {
     return clusterByTopic(items);
   }
 
@@ -205,18 +212,36 @@ function dedupeLabels(clusters: Cluster[], items: ClusterItem[], assign: number[
   });
 }
 
-/** One island per distinct topic tag, in first-appearance order. */
+/**
+ * One island per distinct topic tag, in first-appearance order. Untagged notes
+ * (e.g. ones the user adds to the sample terrain) join the island of their
+ * nearest tagged neighbour, so the clean topic names are preserved.
+ */
 function clusterByTopic(items: ClusterItem[]): ClusterResult {
   const idByTopic = new Map<string, number>();
   const order: string[] = [];
   for (const it of items) {
-    const tp = it.topic ?? "Notes";
-    if (!idByTopic.has(tp)) {
-      idByTopic.set(tp, order.length);
-      order.push(tp);
-    }
+    if (!it.topic || idByTopic.has(it.topic)) continue;
+    idByTopic.set(it.topic, order.length);
+    order.push(it.topic);
   }
-  const assignments = items.map((it) => idByTopic.get(it.topic ?? "Notes")!);
+  const tagged = items.filter((it) => it.topic);
+
+  const assignments = items.map((it) => {
+    if (it.topic) return idByTopic.get(it.topic)!;
+    // Untagged → nearest tagged note's topic.
+    let best = 0;
+    let bestSim = -Infinity;
+    for (const t of tagged) {
+      const sim = cosineSimilarity(it.embedding, t.embedding);
+      if (sim > bestSim) {
+        bestSim = sim;
+        best = idByTopic.get(t.topic!)!;
+      }
+    }
+    return best;
+  });
+
   const clusters: Cluster[] = order.map((label, id) => ({
     id,
     label,
