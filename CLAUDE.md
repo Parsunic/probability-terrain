@@ -1,4 +1,10 @@
-# Probability Terrain
+# Mindscape
+
+> The app is branded **Mindscape** (formerly "Probability Terrain" — that name persists in some older notes/code identifiers). The pitch/landing screen lives at `/launch`; the app itself is the root `/`.
+
+## Working agreement
+
+- **Push by default.** After completing a change and verifying the build passes, `git commit` and `git push` to `origin/main` without waiting to be asked (the user has authorized automatic pushing). Branch first only if explicitly working off `main` for a reason.
 
 A single-page web app: a "living semantic landscape" for notes. User pastes notes, content is chunked + embedded, rendered as an interactive force-directed graph in 2D space. Vague spoken/typed descriptions cause semantically relevant nodes to brighten ("fog clearing") while irrelevant nodes dim — exploration by clicking bright clusters, not keyword search.
 

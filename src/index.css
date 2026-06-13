@@ -39,3 +39,8 @@ html, body, #root {
   82% { opacity: 1; transform: translateY(0); }
   100% { opacity: 0; transform: translateY(-6px); }
 }
+
+@keyframes launch-glow {
+  0%, 100% { box-shadow: 0 0 22px rgba(245, 197, 122, 0.22); }
+  50% { box-shadow: 0 0 42px rgba(245, 197, 122, 0.45); }
+}
