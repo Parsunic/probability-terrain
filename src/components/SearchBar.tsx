@@ -29,9 +29,23 @@ const SpeechRecognitionCtor: (new () => SpeechRecognitionLike) | undefined =
 
 const DEBOUNCE_MS = 450;
 
+/** Detect spoken/typed navigation: "take me to X" / "zoom out". */
+function parseNavCommand(raw: string): { type: "goto"; target: string } | { type: "out" } | null {
+  const s = raw.trim().toLowerCase();
+  if (/^(?:zoom out|back out|go back|step back|take me back|reset|home|exit)\b/.test(s)) return { type: "out" };
+  const m = s.match(/^(?:take me to|go to|navigate to|show me|fly to|jump to|open|expand)\s+(.+)/);
+  if (m) {
+    const target = m[1].replace(/\b(?:the|island|cluster|topic|notes?|please)\b/g, "").trim();
+    if (target.length >= 2) return { type: "goto", target };
+  }
+  return null;
+}
+
 export function SearchBar() {
   const runSearch = useAppStore((s) => s.runSearch);
   const clearSearch = useAppStore((s) => s.clearSearch);
+  const focusClusterByName = useAppStore((s) => s.focusClusterByName);
+  const zoomOut = useAppStore((s) => s.zoomOut);
   const isSearching = useAppStore((s) => s.isSearching);
   const modelReady = useAppStore((s) => s.modelReady);
   const setError = useAppStore((s) => s.setError);
@@ -52,11 +66,24 @@ export function SearchBar() {
     (value: string) => {
       if (debounceRef.current) window.clearTimeout(debounceRef.current);
       debounceRef.current = window.setTimeout(() => {
+        const cmd = parseNavCommand(value);
+        if (cmd) {
+          if (cmd.type === "out") {
+            zoomOut();
+            setText(""); // a command isn't a lingering query
+            return;
+          }
+          // "take me to X" — fly to a matching island; fall back to search if none.
+          if (focusClusterByName(cmd.target)) {
+            setText("");
+            return;
+          }
+        }
         if (value.trim()) runSearch(value);
         else clearSearch();
       }, DEBOUNCE_MS);
     },
-    [runSearch, clearSearch]
+    [runSearch, clearSearch, focusClusterByName, zoomOut]
   );
 
   useEffect(() => {

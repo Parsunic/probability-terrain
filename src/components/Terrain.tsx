@@ -26,8 +26,12 @@ interface SimNode {
   relevance: number;
   igniteOrder: number;
   cluster: number;
+  /** order within the node's cluster (for the expansion ring) */
+  clusterIndex: number;
   /** eased hover intensity 0..1 */
   hover: number;
+  /** eased selection ("focused orb") intensity 0..1 */
+  focus: number;
   /** performance.now() when the node entered the terrain (0 = present since first load) */
   bornAt: number;
 }
@@ -39,11 +43,13 @@ const ACTIVE_RADIUS = 13;
 const HOVER_RADIUS_PADDING = 7;
 const IGNITE_STAGGER = 0.08;
 const DRIFT_AMP = 2.6;
-const CURSOR_RADIUS = 230; // how close the cursor must be to bend a star toward it
-const CURSOR_MAX_PULL = 14; // max px a star leans toward the cursor
-const ARRIVAL_MS = 950; // fade/scale-in time for a freshly added star
-const SPARK_MS = 560; // bright spark flash time on arrival
-const RIPPLE_MS = 1150; // shockwave duration
+const CURSOR_RADIUS = 230;
+const CURSOR_MAX_PULL = 14;
+const ARRIVAL_MS = 950;
+const SPARK_MS = 560;
+const RIPPLE_MS = 1150;
+const FOCUS_SCALE = 1.5; // zoom when focusing a node or expanding a cluster
+const TRAIL_MAX = 10; // memory-trail length
 const FALLBACK_COLOR: [number, number, number] = [138, 148, 170];
 const HOT_COLOR = [245, 197, 122];
 
@@ -78,11 +84,22 @@ interface HoverInfo {
   y: number;
 }
 
+interface LabelRect {
+  id: number;
+  cx: number;
+  cy: number;
+  hw: number;
+  hh: number;
+}
+
 export function Terrain() {
   const nodes = useAppStore((s) => s.nodes);
   const edges = useAppStore((s) => s.edges);
   const clusters = useAppStore((s) => s.clusters);
   const selectNode = useAppStore((s) => s.selectNode);
+  const expandCluster = useAppStore((s) => s.expandCluster);
+  const selectedNodeId = useAppStore((s) => s.selectedNodeId);
+  const expandedClusterId = useAppStore((s) => s.expandedClusterId);
 
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -99,22 +116,34 @@ export function Terrain() {
   const clustersRef = useRef<Cluster[]>([]);
   const anchorsRef = useRef<Map<number, { x: number; y: number }>>(new Map());
   const searchStrengthRef = useRef<number>(0);
+  const expandedIdRef = useRef<number | null>(null);
+  const selectedIdRef = useRef<string | null>(null);
 
-  const camRef = useRef({ cx: 0, cy: 0, scale: 1 });
+  const camRef = useRef({ cx: 0, cy: 0, scale: 1, ax: 0.5, ay: 0.5 });
   const originRef = useRef({ x: 0, y: 0, scale: 1 });
 
   const mouseScreenRef = useRef<{ x: number; y: number } | null>(null);
   const hoveredIdRef = useRef<string | null>(null);
+  const hoveredClusterRef = useRef<number | null>(null);
+  const labelRectsRef = useRef<LabelRect[]>([]);
+  const trailRef = useRef<{ x: number; y: number }[]>([]);
 
   const dustRef = useRef<{ x: number; y: number; r: number; drift: number; phase: number }[]>([]);
   const [hover, setHover] = useState<HoverInfo | null>(null);
+
+  useEffect(() => {
+    selectedIdRef.current = selectedNodeId;
+  }, [selectedNodeId]);
+  useEffect(() => {
+    expandedIdRef.current = expandedClusterId;
+  }, [expandedClusterId]);
 
   // Create the simulation once. Forces read live refs so node/cluster swaps
   // during reconcile never require rebuilding the simulation.
   useEffect(() => {
     const w = window.innerWidth;
     const h = window.innerHeight;
-    camRef.current = { cx: w / 2, cy: h / 2, scale: 1 };
+    camRef.current = { cx: w / 2, cy: h / 2, scale: 1, ax: 0.5, ay: 0.5 };
 
     const linkForce = forceLink<SimNode, SimLink>([])
       .id((d) => d.id)
@@ -122,22 +151,45 @@ export function Terrain() {
       .strength((l) => l.strength * 0.12);
     linkForceRef.current = linkForce;
 
-    // At rest each node is pulled to its cluster anchor (topic islands). During
-    // search the target blends toward gravity: matches to center, others outward.
+    // The shape force. Three regimes:
+    //  - expanded cluster: its nodes fan out on a ring, others are flung away;
+    //  - search: matches pulled to center, the rest pushed outward;
+    //  - rest: every node pulled to its cluster anchor (topic islands).
     const layoutForce = (alpha: number) => {
       const sim = simNodesRef.current;
       const anchors = anchorsRef.current;
+      const cls = clustersRef.current;
       const ss = searchStrengthRef.current;
+      const expanded = expandedIdRef.current;
       const vw = window.innerWidth;
       const vh = window.innerHeight;
       const cx = vw / 2;
       const cy = vh / 2;
       const pushR = Math.min(vw, vh) * 0.4;
+
       for (const n of sim) {
         const anchor = anchors.get(n.cluster) ?? { x: cx, y: cy };
-        let tx = anchor.x;
-        let ty = anchor.y;
-        if (ss > 0.001) {
+        let tx: number;
+        let ty: number;
+        let k: number;
+
+        if (expanded !== null) {
+          if (n.cluster === expanded) {
+            const size = cls[expanded]?.size ?? 1;
+            const ang = (n.clusterIndex / Math.max(1, size)) * Math.PI * 2 - Math.PI / 2;
+            const er = 82 + size * 7;
+            tx = anchor.x + Math.cos(ang) * er;
+            ty = anchor.y + Math.sin(ang) * er;
+            k = 0.07 * alpha;
+          } else {
+            const dx = anchor.x - cx;
+            const dy = anchor.y - cy;
+            const d = Math.hypot(dx, dy) || 1;
+            tx = cx + (dx / d) * Math.min(vw, vh) * 0.66;
+            ty = cy + (dy / d) * Math.min(vw, vh) * 0.66;
+            k = 0.05 * alpha;
+          }
+        } else if (ss > 0.001) {
           let sx: number;
           let sy: number;
           if (n.relevance >= 0.5) {
@@ -152,8 +204,13 @@ export function Terrain() {
           }
           tx = anchor.x + (sx - anchor.x) * ss;
           ty = anchor.y + (sy - anchor.y) * ss;
+          k = (n.relevance >= 0.5 ? 0.05 + 0.05 * ss : 0.05) * alpha;
+        } else {
+          tx = anchor.x;
+          ty = anchor.y;
+          k = 0.05 * alpha;
         }
-        const k = (n.relevance >= 0.5 && ss > 0.001 ? 0.05 + 0.05 * ss : 0.05) * alpha;
+
         n.vx += (tx - n.x) * k;
         n.vy += (ty - n.y) * k;
       }
@@ -177,8 +234,7 @@ export function Terrain() {
     };
   }, []);
 
-  // Reconcile the simulation with the store. Existing nodes keep position; newly
-  // added nodes streak in from the edge (unless this is the very first load).
+  // Reconcile the simulation with the store.
   useEffect(() => {
     const sim = simulationRef.current;
     if (!sim) return;
@@ -190,8 +246,6 @@ export function Terrain() {
 
     const byId = new Map(simNodesRef.current.map((n) => [n.id, n]));
     const prevIds = prevIdsRef.current;
-    // A full replace (fresh ingest gives all-new ids) should form like a first
-    // load, not streak every star in from the edge for several seconds.
     const overlap = nodes.some((n) => prevIds.has(n.id));
     const isFirstLoad = prevIds.size === 0 || !overlap;
     const sameTopology = prevIds.size === nodes.length && nodes.every((n) => prevIds.has(n.id));
@@ -207,8 +261,6 @@ export function Terrain() {
         existing.cluster = n.cluster;
         return existing;
       }
-      // Freshly added star: on first load use its disc position; afterward, streak
-      // in from a random edge point with a staggered spark.
       const spawn = isFirstLoad ? { x: n.x, y: n.y } : edgeSpawn(w, h);
       return {
         id: n.id,
@@ -224,11 +276,21 @@ export function Terrain() {
         relevance: n.relevance,
         igniteOrder: n.igniteOrder,
         cluster: n.cluster,
+        clusterIndex: 0,
         hover: 0,
-        // Cap the cascade so even a big incremental add finishes streaking in <1s.
+        focus: 0,
         bornAt: isFirstLoad ? 0 : bornBase + Math.min(arrivals++, 14) * 70,
       };
     });
+
+    // Assign each node its index within its cluster (drives the expansion ring).
+    const clusterCounters = new Map<number, number>();
+    for (const n of next) {
+      const k = clusterCounters.get(n.cluster) ?? 0;
+      n.clusterIndex = k;
+      clusterCounters.set(n.cluster, k + 1);
+    }
+
     simNodesRef.current = next;
     nodeByIdRef.current = new Map(next.map((n) => [n.id, n]));
     sim.nodes(next);
@@ -239,7 +301,6 @@ export function Terrain() {
       const links: SimLink[] = edges.map((e) => ({ source: e.source, target: e.target, strength: e.strength }));
       linksRef.current = links;
       linkForceRef.current?.links(links);
-      // Adjacency for the hover "local constellation" preview.
       const adj = new Map<string, Set<string>>();
       for (const e of edges) {
         (adj.get(e.source) ?? adj.set(e.source, new Set()).get(e.source)!).add(e.target);
@@ -247,6 +308,7 @@ export function Terrain() {
       }
       adjacencyRef.current = adj;
       prevIdsRef.current = new Set(nodes.map((n) => n.id));
+      trailRef.current = []; // a new terrain starts a fresh trail of thought
     }
     sim.alpha(sameTopology ? 0.4 : 0.7).restart();
   }, [nodes, edges, clusters]);
@@ -285,8 +347,11 @@ export function Terrain() {
     let searchStrength = 0;
     let cursorStrength = 0;
     let hoverStrength = 0;
+    let focusStrength = 0;
+    let expandStrength = 0;
     let prevIgniteStamp = 0;
     let rippleStart = 0;
+    let prevFocalKey: string | null = null;
     const start = performance.now();
 
     const draw = () => {
@@ -302,28 +367,51 @@ export function Terrain() {
       const anchors = anchorsRef.current;
       const igniteElapsed = (now - igniteStartRef.current) / 1000;
 
-      // Ignore a hovered id that no longer exists (after reset/clear/fresh-ingest)
-      // so the depth-of-field dim relaxes instead of getting stuck on.
+      const selectedId = selectedIdRef.current && nodeById.has(selectedIdRef.current) ? selectedIdRef.current : null;
+      const selNode = selectedId ? nodeById.get(selectedId)! : null;
+      const selNeighbors = selectedId ? adjacencyRef.current.get(selectedId) : null;
+      const expandedId = expandedIdRef.current;
+
       const rawHovered = hoveredIdRef.current;
       const hoveredId = rawHovered && nodeById.has(rawHovered) ? rawHovered : null;
       const neighbors = hoveredId ? adjacencyRef.current.get(hoveredId) : null;
-      hoverStrength += ((hoveredId ? 1 : 0) - hoverStrength) * 0.14;
 
-      // Cursor → world (using last frame's camera; close enough).
+      hoverStrength += ((hoveredId ? 1 : 0) - hoverStrength) * 0.14;
+      focusStrength += ((selNode ? 1 : 0) - focusStrength) * 0.08;
+      expandStrength += ((expandedId !== null ? 1 : 0) - expandStrength) * 0.08;
+
+      // Memory trail: record a focal point whenever the focus changes.
+      const focalKey = selectedId ? `n:${selectedId}` : expandedId !== null ? `c:${expandedId}` : null;
+      if (focalKey && focalKey !== prevFocalKey) {
+        let fx: number | undefined;
+        let fy: number | undefined;
+        if (selNode) {
+          fx = selNode.x;
+          fy = selNode.y;
+        } else if (expandedId !== null && anchors.has(expandedId)) {
+          const a = anchors.get(expandedId)!;
+          fx = a.x;
+          fy = a.y;
+        }
+        if (fx !== undefined && fy !== undefined) {
+          trailRef.current.push({ x: fx, y: fy });
+          if (trailRef.current.length > TRAIL_MAX) trailRef.current.shift();
+        }
+      }
+      prevFocalKey = focalKey;
+
       const ms = mouseScreenRef.current;
       cursorStrength += ((ms ? 1 : 0) - cursorStrength) * 0.08;
       const o = originRef.current;
       const mw = ms ? { x: (ms.x - o.x) / o.scale, y: (ms.y - o.y) / o.scale } : null;
 
-      // Per-cluster pulse — whole islands inhale together.
       const clusterPulse = (id: number) => 0.5 + 0.5 * Math.sin(t * 0.35 + id * 1.3);
 
-      // Advance display relevance (staggered ignite), hover ease, and the
-      // rendered position (living drift + cursor gravity, off during search).
       let maxHeat = 0;
       let maxRel = 0;
       let hasHot = false;
-      const pullScale = CURSOR_MAX_PULL * cursorStrength * (1 - searchStrength);
+      // Cursor gravity is off during search and while focused (node/cluster).
+      const pullScale = CURSOR_MAX_PULL * cursorStrength * (1 - searchStrength) * (1 - Math.max(focusStrength, expandStrength));
       for (const n of simNodes) {
         const target = n.relevance;
         if (target > maxRel) maxRel = target;
@@ -334,6 +422,7 @@ export function Terrain() {
         if (n.displayRelevance > maxHeat) maxHeat = n.displayRelevance;
 
         n.hover += ((hoveredId === n.id ? 1 : 0) - n.hover) * 0.16;
+        n.focus += ((selectedId === n.id ? 1 : 0) - n.focus) * 0.12;
 
         let ox = Math.sin(t * 0.18 + n.breathPhase) * DRIFT_AMP;
         let oy = Math.cos(t * 0.15 + n.breathPhase * 1.3) * DRIFT_AMP;
@@ -355,35 +444,54 @@ export function Terrain() {
       searchStrength += ((searchActive ? 1 : 0) - searchStrength) * 0.05;
       searchStrengthRef.current = searchStrength;
       const sim = simulationRef.current;
-      if (sim) sim.alphaTarget(searchStrength > 0.02 ? 0.18 : 0);
+      // Keep the physics warm while any mode is actively reshaping the map.
+      const warm = searchStrength > 0.02 || expandStrength > 0.02 || expandedId !== null;
+      if (sim) sim.alphaTarget(warm ? 0.18 : 0);
 
-      // Shockwave whenever a new match set locks in (search, find-similar, re-search).
-      // igniteStartRef changes on every re-ranking, so this re-fires where a plain
-      // rising-edge on "has matches" would miss back-to-back searches.
       const igniteStamp = igniteStartRef.current;
       if (hasHot && igniteStamp !== prevIgniteStamp) rippleStart = now;
       prevIgniteStamp = igniteStamp;
 
-      // Camera drifts toward the hot cluster (gravity pulls it to center).
-      let hx = 0;
-      let hy = 0;
-      let hwt = 0;
-      for (const n of simNodes) {
-        if (n.igniteOrder >= 0) {
-          hx += n.rx * n.relevance;
-          hy += n.ry * n.relevance;
-          hwt += n.relevance;
-        }
-      }
+      // --- Camera: node focus > cluster expansion > search gravity > rest ---
       const cam = camRef.current;
-      const targetCx = hwt > 0 ? hx / hwt : w / 2;
-      const targetCy = hwt > 0 ? hy / hwt : h / 2;
-      const targetScale = hwt > 0 ? 1.18 : 1;
-      cam.cx += (targetCx - cam.cx) * 0.035;
-      cam.cy += (targetCy - cam.cy) * 0.035;
-      cam.scale += (targetScale - cam.scale) * 0.035;
-      const originX = w / 2 - cam.scale * cam.cx;
-      const originY = h / 2 - cam.scale * cam.cy;
+      let tCx: number;
+      let tCy: number;
+      let tScale: number;
+      let tAx = 0.5;
+      let tAy = 0.5;
+      if (selNode) {
+        tCx = selNode.x;
+        tCy = selNode.y;
+        tScale = FOCUS_SCALE;
+        tAx = 0.33; // orb to the left, reading card to the right
+      } else if (expandedId !== null && anchors.has(expandedId)) {
+        const a = anchors.get(expandedId)!;
+        tCx = a.x;
+        tCy = a.y;
+        tScale = FOCUS_SCALE;
+        tAy = 0.46;
+      } else {
+        let hx = 0;
+        let hy = 0;
+        let hwt = 0;
+        for (const n of simNodes) {
+          if (n.igniteOrder >= 0) {
+            hx += n.rx * n.relevance;
+            hy += n.ry * n.relevance;
+            hwt += n.relevance;
+          }
+        }
+        tCx = hwt > 0 ? hx / hwt : w / 2;
+        tCy = hwt > 0 ? hy / hwt : h / 2;
+        tScale = hwt > 0 ? 1.18 : 1;
+      }
+      cam.cx += (tCx - cam.cx) * 0.05;
+      cam.cy += (tCy - cam.cy) * 0.05;
+      cam.scale += (tScale - cam.scale) * 0.05;
+      cam.ax += (tAx - cam.ax) * 0.05;
+      cam.ay += (tAy - cam.ay) * 0.05;
+      const originX = cam.ax * w - cam.scale * cam.cx;
+      const originY = cam.ay * h - cam.scale * cam.cy;
       originRef.current = { x: originX, y: originY, scale: cam.scale };
 
       // --- screen space ---
@@ -411,6 +519,29 @@ export function Terrain() {
       ctx.translate(originX, originY);
       ctx.scale(cam.scale, cam.scale);
 
+      // Memory trail — the fading path of where you've explored.
+      const trail = trailRef.current;
+      if (trail.length >= 2) {
+        for (let i = 1; i < trail.length; i++) {
+          const a = trail[i - 1];
+          const b = trail[i];
+          const recency = i / trail.length;
+          ctx.beginPath();
+          ctx.moveTo(a.x, a.y);
+          ctx.lineTo(b.x, b.y);
+          ctx.strokeStyle = `rgba(245, 210, 160, ${0.03 + recency * 0.1})`;
+          ctx.lineWidth = (0.5 + recency) / cam.scale;
+          ctx.stroke();
+        }
+      }
+      for (let i = 0; i < trail.length; i++) {
+        const recency = (i + 1) / trail.length;
+        ctx.beginPath();
+        ctx.arc(trail[i].x, trail[i].y, (1 + recency * 1.5) / cam.scale, 0, Math.PI * 2);
+        ctx.fillStyle = `rgba(245, 210, 160, ${0.05 + recency * 0.16})`;
+        ctx.fill();
+      }
+
       // Knowledge-density glow, pinned to anchors, breathing per island.
       const densityFade = 1 - searchStrength * 0.85;
       if (densityFade > 0.02) {
@@ -418,10 +549,11 @@ export function Terrain() {
         for (let c = 0; c < cls.length; c++) {
           const anchor = anchors.get(cls[c].id);
           if (!anchor || cls[c].size === 0) continue;
+          const collapsedDim = expandedId !== null && cls[c].id !== expandedId ? 1 - expandStrength * 0.85 : 1;
           const pulse = clusterPulse(cls[c].id);
           const [r, g, b] = cls[c].color;
           const radius = (70 + cls[c].size * 9) * (0.86 + 0.14 * pulse);
-          const a = Math.min(0.13, 0.03 + cls[c].size * 0.006) * densityFade * (0.78 + 0.22 * pulse);
+          const a = Math.min(0.13, 0.03 + cls[c].size * 0.006) * densityFade * (0.78 + 0.22 * pulse) * collapsedDim;
           const grad = ctx.createRadialGradient(anchor.x, anchor.y, 0, anchor.x, anchor.y, radius);
           grad.addColorStop(0, `rgba(${r}, ${g}, ${b}, ${a})`);
           grad.addColorStop(1, `rgba(${r}, ${g}, ${b}, 0)`);
@@ -433,7 +565,7 @@ export function Terrain() {
         ctx.globalCompositeOperation = "source-over";
       }
 
-      // Constellation edges (brighten the hovered node's local web).
+      // Constellation edges (brighten the hovered/selected node's local web).
       for (const link of links) {
         const aId = typeof link.source === "string" ? link.source : (link.source as SimNode).id;
         const bId = typeof link.target === "string" ? link.target : (link.target as SimNode).id;
@@ -445,26 +577,30 @@ export function Terrain() {
           ? Math.max(a.displayRelevance, b.displayRelevance)
           : Math.min(a.displayRelevance, b.displayRelevance);
         let opacity = 0.016 + heat * 0.22;
-        const touchesHover = hoveredId === aId || hoveredId === bId;
-        if (touchesHover) opacity = Math.max(opacity, 0.06 + 0.5 * Math.max(a.hover, b.hover));
-        if (opacity < 0.022 && maxHeat > 0.1 && !touchesHover) continue;
+        const lit = hoveredId === aId || hoveredId === bId || selectedId === aId || selectedId === bId;
+        if (lit) {
+          const amt = Math.max(a.hover, b.hover, a.focus, b.focus);
+          opacity = Math.max(opacity, 0.06 + 0.5 * amt);
+        }
+        if (opacity < 0.022 && maxHeat > 0.1 && !lit) continue;
         ctx.beginPath();
         ctx.moveTo(a.rx, a.ry);
         ctx.lineTo(b.rx, b.ry);
         ctx.strokeStyle = `rgba(245, 220, 180, ${opacity})`;
-        ctx.lineWidth = (touchesHover ? 1.4 : 1) / cam.scale;
+        ctx.lineWidth = (lit ? 1.4 : 1) / cam.scale;
         ctx.stroke();
       }
 
-      // Bloom halos (additive) for warm nodes.
+      // Bloom halos (additive) for warm / hovered / focused nodes.
       ctx.globalCompositeOperation = "lighter";
       for (const n of simNodes) {
         const dr = n.displayRelevance;
         const arrival = n.bornAt === 0 ? 1 : Math.max(0, Math.min(1, (now - n.bornAt) / ARRIVAL_MS));
-        const glowAmt = Math.max(dr, n.hover * 0.6) * arrival;
+        const lift = Math.max(n.hover, n.focus);
+        const glowAmt = Math.max(dr, lift * 0.7) * arrival;
         if (glowAmt <= 0.05) continue;
         const breathe = 1 + Math.sin(t * 0.8 + n.breathPhase) * 0.08;
-        const radius = (REST_RADIUS + (ACTIVE_RADIUS - REST_RADIUS) * dr) * breathe * (1 + 0.55 * n.hover);
+        const radius = (REST_RADIUS + (ACTIVE_RADIUS - REST_RADIUS) * dr) * breathe * (1 + 0.6 * lift);
         const glow = ctx.createRadialGradient(n.rx, n.ry, 0, n.rx, n.ry, radius * 4.5);
         glow.addColorStop(0, `rgba(245, 197, 122, ${0.5 * glowAmt})`);
         glow.addColorStop(0.4, `rgba(245, 170, 100, ${0.18 * glowAmt})`);
@@ -482,13 +618,14 @@ export function Terrain() {
         const dr = n.displayRelevance;
         const arrival = n.bornAt === 0 ? 1 : Math.max(0, Math.min(1, (now - n.bornAt) / ARRIVAL_MS));
         if (arrival <= 0) continue;
+        const lift = Math.max(n.hover, n.focus);
         const breathe = 1 + Math.sin(t * 0.8 + n.breathPhase) * 0.08;
         const islandBreath = 0.97 + 0.03 * clusterPulse(n.cluster);
         const radius =
           (REST_RADIUS + (ACTIVE_RADIUS - REST_RADIUS) * dr) *
           breathe *
           islandBreath *
-          (1 + 0.55 * n.hover) *
+          (1 + 0.6 * lift) *
           (0.4 + 0.6 * arrival);
         const rest = cls[n.cluster]?.color ?? FALLBACK_COLOR;
 
@@ -496,27 +633,37 @@ export function Terrain() {
         const g = rest[1] + (HOT_COLOR[1] - rest[1]) * dr;
         const b = rest[2] + (HOT_COLOR[2] - rest[2]) * dr;
 
-        // Depth-of-field: when hovering, the hovered node + its neighbours stay
-        // bright while the rest of the field softens.
-        const isNeighbor = neighbors?.has(n.id) ? 1 : 0;
-        const focus = Math.max(n.hover, isNeighbor * 0.55);
-        const dof = 1 - hoverStrength * (1 - focus) * 0.5;
-        const alpha = Math.max(0.05, Math.min(1, (0.34 * coldFade + dr * 0.9 + n.hover * 0.25) * dof)) * arrival;
+        // Spotlight: combine hover / selection / expansion dimming of the rest.
+        let prominence = 0;
+        let dimStrength = 0;
+        if (hoverStrength > 0.001) {
+          dimStrength = Math.max(dimStrength, hoverStrength);
+          prominence = Math.max(prominence, n.hover, neighbors?.has(n.id) ? 0.5 : 0);
+        }
+        if (focusStrength > 0.001) {
+          dimStrength = Math.max(dimStrength, focusStrength);
+          prominence = Math.max(prominence, n.focus, n.id === selectedId ? 1 : selNeighbors?.has(n.id) ? 0.5 : 0);
+        }
+        if (expandStrength > 0.001) {
+          dimStrength = Math.max(dimStrength, expandStrength);
+          prominence = Math.max(prominence, n.cluster === expandedId ? 1 : 0);
+        }
+        const dof = 1 - dimStrength * (1 - Math.min(1, prominence)) * 0.62;
+        const alpha = Math.max(0.05, Math.min(1, (0.34 * coldFade + dr * 0.9 + lift * 0.25) * dof)) * arrival;
 
         ctx.beginPath();
         ctx.arc(n.rx, n.ry, radius, 0, Math.PI * 2);
         ctx.fillStyle = `rgba(${r}, ${g}, ${b}, ${alpha})`;
         ctx.fill();
 
-        if (dr > 0.4 || n.hover > 0.2) {
-          const k = Math.max(Math.min(1, dr * 0.9), n.hover * 0.85);
+        if (dr > 0.4 || lift > 0.2) {
+          const k = Math.max(Math.min(1, dr * 0.9), lift * 0.85);
           ctx.beginPath();
           ctx.arc(n.rx, n.ry, radius * 0.45, 0, Math.PI * 2);
           ctx.fillStyle = `rgba(255, 245, 230, ${k})`;
           ctx.fill();
         }
 
-        // Arrival spark — a quick bright flash where a new star lands.
         if (n.bornAt !== 0) {
           const spark = now >= n.bornAt ? Math.max(0, 1 - (now - n.bornAt) / SPARK_MS) : 0;
           if (spark > 0.01) {
@@ -533,11 +680,10 @@ export function Terrain() {
           }
         }
 
-        // Hover halo ring.
-        if (n.hover > 0.02) {
+        if (lift > 0.02) {
           ctx.beginPath();
-          ctx.arc(n.rx, n.ry, radius + 6 + n.hover * 3, 0, Math.PI * 2);
-          ctx.strokeStyle = `rgba(255, 240, 214, ${0.5 * n.hover})`;
+          ctx.arc(n.rx, n.ry, radius + 6 + lift * 4, 0, Math.PI * 2);
+          ctx.strokeStyle = `rgba(255, 240, 214, ${0.5 * lift})`;
           ctx.lineWidth = 1.4 / cam.scale;
           ctx.stroke();
         }
@@ -545,7 +691,7 @@ export function Terrain() {
 
       ctx.restore();
 
-      // --- shockwave ripple (screen space, centered where matches gather) ---
+      // --- shockwave ripple ---
       const rElapsed = (now - rippleStart) / RIPPLE_MS;
       if (rippleStart > 0 && rElapsed < 1) {
         const ease = 1 - (1 - rElapsed) * (1 - rElapsed);
@@ -561,26 +707,56 @@ export function Terrain() {
         }
       }
 
-      // --- topic labels (screen space) ---
+      // --- topic labels (screen space) + hover/expanded count pill ---
       const labelAlpha = (1 - searchStrength * 0.88) * (1 - hoverStrength * 0.4) * 0.6;
-      if (labelAlpha > 0.03) {
-        ctx.font = "500 13px system-ui, -apple-system, 'Segoe UI', sans-serif";
+      const rects: LabelRect[] = [];
+      if (labelAlpha > 0.06) {
         ctx.textAlign = "center";
         ctx.textBaseline = "middle";
-        try {
-          ctx.letterSpacing = "1.5px";
-        } catch {
-          /* older engines ignore letterSpacing */
-        }
         for (let c = 0; c < cls.length; c++) {
           const anchor = anchors.get(cls[c].id);
           if (!anchor || cls[c].size === 0) continue;
           const sx = originX + cam.scale * anchor.x;
           const sy = originY + cam.scale * anchor.y - (78 + cls[c].size * 1.5);
           const [r, g, b] = cls[c].color;
-          const sizeBoost = Math.min(0.25, cls[c].size * 0.015);
-          ctx.fillStyle = `rgba(${Math.min(255, r + 60)}, ${Math.min(255, g + 60)}, ${Math.min(255, b + 60)}, ${labelAlpha + sizeBoost})`;
-          ctx.fillText(cls[c].label.toUpperCase(), sx, sy);
+          const isActive = hoveredClusterRef.current === cls[c].id || expandedId === cls[c].id;
+
+          if (isActive) {
+            const txt = `${cls[c].label.toUpperCase()}   ·   ${cls[c].size} ${cls[c].size === 1 ? "note" : "notes"}`;
+            ctx.font = "600 13px system-ui, -apple-system, 'Segoe UI', sans-serif";
+            try {
+              ctx.letterSpacing = "1.5px";
+            } catch {
+              /* ignore */
+            }
+            const tw = ctx.measureText(txt).width;
+            const padX = 14;
+            const padY = 8;
+            const bw = tw + padX * 2;
+            const bh = 13 + padY * 2;
+            ctx.beginPath();
+            ctx.roundRect(sx - bw / 2, sy - bh / 2, bw, bh, bh / 2);
+            ctx.fillStyle = `rgba(${r}, ${g}, ${b}, 0.16)`;
+            ctx.fill();
+            ctx.strokeStyle = `rgba(${Math.min(255, r + 60)}, ${Math.min(255, g + 60)}, ${Math.min(255, b + 60)}, 0.5)`;
+            ctx.lineWidth = 1;
+            ctx.stroke();
+            ctx.fillStyle = `rgba(${Math.min(255, r + 80)}, ${Math.min(255, g + 80)}, ${Math.min(255, b + 80)}, 0.95)`;
+            ctx.fillText(txt, sx, sy);
+            rects.push({ id: cls[c].id, cx: sx, cy: sy, hw: bw / 2 + 6, hh: bh / 2 + 6 });
+          } else {
+            ctx.font = "500 13px system-ui, -apple-system, 'Segoe UI', sans-serif";
+            try {
+              ctx.letterSpacing = "1.5px";
+            } catch {
+              /* ignore */
+            }
+            const sizeBoost = Math.min(0.25, cls[c].size * 0.015);
+            ctx.fillStyle = `rgba(${Math.min(255, r + 60)}, ${Math.min(255, g + 60)}, ${Math.min(255, b + 60)}, ${labelAlpha + sizeBoost})`;
+            ctx.fillText(cls[c].label.toUpperCase(), sx, sy);
+            const tw = ctx.measureText(cls[c].label.toUpperCase()).width + cls[c].label.length * 1.5;
+            rects.push({ id: cls[c].id, cx: sx, cy: sy, hw: tw / 2 + 10, hh: 16 });
+          }
         }
         try {
           ctx.letterSpacing = "0px";
@@ -588,6 +764,7 @@ export function Terrain() {
           /* ignore */
         }
       }
+      labelRectsRef.current = rects;
 
       // --- vignette ---
       const vig = ctx.createRadialGradient(w / 2, h / 2, Math.min(w, h) * 0.35, w / 2, h / 2, Math.max(w, h) * 0.75);
@@ -613,6 +790,13 @@ export function Terrain() {
       return null;
     };
 
+    const findClusterAt = (sx: number, sy: number): number | null => {
+      for (const r of labelRectsRef.current) {
+        if (Math.abs(sx - r.cx) <= r.hw && Math.abs(sy - r.cy) <= r.hh) return r.id;
+      }
+      return null;
+    };
+
     const onMouseMove = (e: MouseEvent) => {
       const rect = canvas.getBoundingClientRect();
       const sx = e.clientX - rect.left;
@@ -620,7 +804,8 @@ export function Terrain() {
       mouseScreenRef.current = { x: sx, y: sy };
       const node = findNodeAt(sx, sy);
       hoveredIdRef.current = node?.id ?? null;
-      if (node) {
+      if (node && node.id !== selectedIdRef.current) {
+        hoveredClusterRef.current = null;
         const cl = clustersRef.current[node.cluster];
         setHover({
           text: node.text,
@@ -631,21 +816,38 @@ export function Terrain() {
         });
         canvas.style.cursor = "pointer";
       } else {
+        const clusterId = findClusterAt(sx, sy);
+        hoveredClusterRef.current = clusterId;
         setHover(null);
-        canvas.style.cursor = "default";
+        canvas.style.cursor = clusterId !== null ? "pointer" : "default";
       }
     };
 
     const onMouseLeave = () => {
       mouseScreenRef.current = null;
       hoveredIdRef.current = null;
+      hoveredClusterRef.current = null;
       setHover(null);
     };
 
     const onClick = (e: MouseEvent) => {
       const rect = canvas.getBoundingClientRect();
-      const node = findNodeAt(e.clientX - rect.left, e.clientY - rect.top);
-      if (node) selectNode(node.id);
+      const sx = e.clientX - rect.left;
+      const sy = e.clientY - rect.top;
+      const node = findNodeAt(sx, sy);
+      if (node) {
+        selectNode(node.id);
+        return;
+      }
+      const clusterId = findClusterAt(sx, sy);
+      if (clusterId !== null) {
+        // Toggle: clicking the already-expanded island collapses it.
+        expandCluster(expandedIdRef.current === clusterId ? null : clusterId);
+        return;
+      }
+      // Empty space → step back out of the current focus.
+      if (selectedIdRef.current) selectNode(null);
+      else if (expandedIdRef.current !== null) expandCluster(null);
     };
 
     canvas.addEventListener("mousemove", onMouseMove);
@@ -659,7 +861,7 @@ export function Terrain() {
       canvas.removeEventListener("mouseleave", onMouseLeave);
       canvas.removeEventListener("click", onClick);
     };
-  }, [selectNode]);
+  }, [selectNode, expandCluster]);
 
   return (
     <div ref={containerRef} className="absolute inset-0">

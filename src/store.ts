@@ -39,12 +39,20 @@ interface AppState {
   /** The in-browser model has finished downloading + warming up. */
   modelReady: boolean;
 
+  /** Which topic island is currently expanded ("bloomed open"), if any. */
+  expandedClusterId: number | null;
+
   loadSample: () => void;
   ingest: (raw: string, opts?: { fresh?: boolean }) => Promise<void>;
   runSearch: (query: string) => Promise<void>;
   clearSearch: () => void;
   clearTerrain: () => void;
   selectNode: (id: string | null) => void;
+  expandCluster: (id: number | null) => void;
+  /** Voice/text navigation: expand the island whose label best matches the name. */
+  focusClusterByName: (name: string) => boolean;
+  /** Step back out of any focus (node, cluster, or search) to the resting map. */
+  zoomOut: () => void;
   findSimilarTo: (nodeId: string) => Promise<void>;
   setModelReady: (ready: boolean) => void;
   setError: (message: string | null) => void;
@@ -222,6 +230,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   datasetProvider: "minilm",
   query: "",
   selectedNodeId: null,
+  expandedClusterId: null,
   isSearching: false,
   isWorking: false,
   workingMessage: "",
@@ -242,6 +251,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       datasetProvider: "minilm",
       query: "",
       selectedNodeId: null,
+      expandedClusterId: null,
     });
   },
 
@@ -286,6 +296,8 @@ export const useAppStore = create<AppState>((set, get) => ({
         isWorking: false,
         isSearching: false,
         query: "",
+        selectedNodeId: null,
+        expandedClusterId: null,
       });
     } catch (e) {
       set({ isWorking: false, errorMessage: errorText(e) });
@@ -295,7 +307,8 @@ export const useAppStore = create<AppState>((set, get) => ({
   runSearch: async (query: string) => {
     const trimmed = query.trim();
     const gen = ++searchGen;
-    set({ query, isSearching: true, errorMessage: null });
+    // Searching is its own focus mode — drop any node/cluster focus.
+    set({ query, isSearching: true, errorMessage: null, selectedNodeId: null, expandedClusterId: null });
 
     if (trimmed.length === 0) {
       get().clearSearch();
@@ -327,15 +340,50 @@ export const useAppStore = create<AppState>((set, get) => ({
     set({
       query: "",
       isSearching: false,
+      selectedNodeId: null,
+      expandedClusterId: null,
       nodes: get().nodes.map((n) => ({ ...n, relevance: 0, igniteOrder: -1 })),
     });
   },
 
   clearTerrain: () => {
-    set({ nodes: [], edges: [], clusters: [], query: "", selectedNodeId: null });
+    set({ nodes: [], edges: [], clusters: [], query: "", selectedNodeId: null, expandedClusterId: null });
   },
 
   selectNode: (id) => set({ selectedNodeId: id }),
+
+  expandCluster: (id) =>
+    set((s) => ({
+      expandedClusterId: id,
+      selectedNodeId: null,
+      query: "",
+      // Expanding is its own mode; clear any active search ranking.
+      nodes: s.nodes.map((n) => ({ ...n, relevance: 0, igniteOrder: -1 })),
+    })),
+
+  focusClusterByName: (name) => {
+    const clusters = get().clusters;
+    const q = name.toLowerCase().trim();
+    if (!q) return false;
+    const norm = (s: string) => s.toLowerCase();
+    // Best match: a label that contains the spoken phrase, else any token overlap.
+    let match = clusters.find((c) => norm(c.label).includes(q) || q.includes(norm(c.label)));
+    if (!match) {
+      const tokens = q.split(/\s+/).filter((t) => t.length > 2);
+      match = clusters.find((c) => tokens.some((t) => norm(c.label).includes(t)));
+    }
+    if (!match) return false;
+    get().expandCluster(match.id);
+    return true;
+  },
+
+  zoomOut: () =>
+    set((s) => ({
+      expandedClusterId: null,
+      selectedNodeId: null,
+      query: "",
+      nodes: s.nodes.map((n) => ({ ...n, relevance: 0, igniteOrder: -1 })),
+    })),
 
   findSimilarTo: async (nodeId: string) => {
     const seed = get().nodes.find((n) => n.id === nodeId);
@@ -345,6 +393,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     const snippet = seed.text.split(/\s+/).slice(0, 6).join(" ");
     set({
       selectedNodeId: null,
+      expandedClusterId: null,
       query: `similar to: ${snippet}…`,
       nodes: applyRelevance(get().nodes, seed.embedding),
     });
