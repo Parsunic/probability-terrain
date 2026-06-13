@@ -1,0 +1,5 @@
+# Treat the self-hosted model + ONNX runtime as binary so line-ending
+# normalization can never corrupt them.
+*.wasm binary
+*.onnx binary
+*.bin binary
