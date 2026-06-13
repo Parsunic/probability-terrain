@@ -350,7 +350,10 @@ export const useAppStore = create<AppState>((set, get) => ({
     set({ nodes: [], edges: [], clusters: [], query: "", selectedNodeId: null, expandedClusterId: null });
   },
 
-  selectNode: (id) => set({ selectedNodeId: id }),
+  // Selecting a real node is its own focus mode — collapse any expanded cluster
+  // so the two modes can't fight over the camera/physics. (selectNode(null) just
+  // closes the panel and must NOT touch expansion, so empty-click step-back works.)
+  selectNode: (id) => set(id ? { selectedNodeId: id, expandedClusterId: null } : { selectedNodeId: id }),
 
   expandCluster: (id) =>
     set((s) => ({
@@ -363,17 +366,24 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   focusClusterByName: (name) => {
     const clusters = get().clusters;
-    const q = name.toLowerCase().trim();
-    if (!q) return false;
-    const norm = (s: string) => s.toLowerCase();
-    // Best match: a label that contains the spoken phrase, else any token overlap.
-    let match = clusters.find((c) => norm(c.label).includes(q) || q.includes(norm(c.label)));
-    if (!match) {
-      const tokens = q.split(/\s+/).filter((t) => t.length > 2);
-      match = clusters.find((c) => tokens.some((t) => norm(c.label).includes(t)));
+    // Whole-word token overlap (split on the "·" separator and spaces), so "work"
+    // never matches "workout" and a stray word in a long phrase can't hijack it.
+    const tokenize = (s: string) => s.toLowerCase().split(/[^a-z0-9]+/).filter((t) => t.length > 2);
+    const queryTokens = new Set(tokenize(name));
+    if (queryTokens.size === 0) return false;
+
+    let best: Cluster | null = null;
+    let bestScore = 0;
+    for (const c of clusters) {
+      const overlap = tokenize(c.label).filter((t) => queryTokens.has(t)).length;
+      if (overlap > bestScore || (overlap === bestScore && overlap > 0 && c.size > (best?.size ?? 0))) {
+        best = c;
+        bestScore = overlap;
+      }
     }
-    if (!match) return false;
-    get().expandCluster(match.id);
+    if (!best || bestScore === 0) return false;
+    if (best.id === get().expandedClusterId) return true; // already there — don't re-jump
+    get().expandCluster(best.id);
     return true;
   },
 

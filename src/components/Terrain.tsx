@@ -98,6 +98,7 @@ export function Terrain() {
   const clusters = useAppStore((s) => s.clusters);
   const selectNode = useAppStore((s) => s.selectNode);
   const expandCluster = useAppStore((s) => s.expandCluster);
+  const zoomOut = useAppStore((s) => s.zoomOut);
   const selectedNodeId = useAppStore((s) => s.selectedNodeId);
   const expandedClusterId = useAppStore((s) => s.expandedClusterId);
 
@@ -114,6 +115,7 @@ export function Terrain() {
   const adjacencyRef = useRef<Map<string, Set<string>>>(new Map());
 
   const clustersRef = useRef<Cluster[]>([]);
+  const prevClustersRef = useRef<Cluster[]>([]);
   const anchorsRef = useRef<Map<number, { x: number; y: number }>>(new Map());
   const searchStrengthRef = useRef<number>(0);
   const expandedIdRef = useRef<number | null>(null);
@@ -240,6 +242,12 @@ export function Terrain() {
     if (!sim) return;
 
     clustersRef.current = clusters;
+    // The trail lives in world coordinates tied to the cluster layout, so reset it
+    // whenever the clustering changes (load / add / re-embed), not just on new ids.
+    if (clusters !== prevClustersRef.current) {
+      trailRef.current = [];
+      prevClustersRef.current = clusters;
+    }
     const w = window.innerWidth;
     const h = window.innerHeight;
     anchorsRef.current = computeAnchors(clusters, w, h);
@@ -308,7 +316,6 @@ export function Terrain() {
       }
       adjacencyRef.current = adj;
       prevIdsRef.current = new Set(nodes.map((n) => n.id));
-      trailRef.current = []; // a new terrain starts a fresh trail of thought
     }
     sim.alpha(sameTopology ? 0.4 : 0.7).restart();
   }, [nodes, edges, clusters]);
@@ -386,16 +393,19 @@ export function Terrain() {
         let fx: number | undefined;
         let fy: number | undefined;
         if (selNode) {
-          fx = selNode.x;
-          fy = selNode.y;
+          fx = selNode.rx; // rendered position, so the dot sits on the drawn orb
+          fy = selNode.ry;
         } else if (expandedId !== null && anchors.has(expandedId)) {
           const a = anchors.get(expandedId)!;
           fx = a.x;
           fy = a.y;
         }
         if (fx !== undefined && fy !== undefined) {
-          trailRef.current.push({ x: fx, y: fy });
-          if (trailRef.current.length > TRAIL_MAX) trailRef.current.shift();
+          const last = trailRef.current[trailRef.current.length - 1];
+          if (!last || Math.hypot(last.x - fx, last.y - fy) > 1) {
+            trailRef.current.push({ x: fx, y: fy });
+            if (trailRef.current.length > TRAIL_MAX) trailRef.current.shift();
+          }
         }
       }
       prevFocalKey = focalKey;
@@ -753,8 +763,10 @@ export function Terrain() {
             }
             const sizeBoost = Math.min(0.25, cls[c].size * 0.015);
             ctx.fillStyle = `rgba(${Math.min(255, r + 60)}, ${Math.min(255, g + 60)}, ${Math.min(255, b + 60)}, ${labelAlpha + sizeBoost})`;
-            ctx.fillText(cls[c].label.toUpperCase(), sx, sy);
-            const tw = ctx.measureText(cls[c].label.toUpperCase()).width + cls[c].label.length * 1.5;
+            const upper = cls[c].label.toUpperCase();
+            ctx.fillText(upper, sx, sy);
+            // measureText already includes the active letterSpacing — don't re-add it.
+            const tw = ctx.measureText(upper).width;
             rects.push({ id: cls[c].id, cx: sx, cy: sy, hw: tw / 2 + 10, hh: 16 });
           }
         }
@@ -845,9 +857,8 @@ export function Terrain() {
         expandCluster(expandedIdRef.current === clusterId ? null : clusterId);
         return;
       }
-      // Empty space → step back out of the current focus.
-      if (selectedIdRef.current) selectNode(null);
-      else if (expandedIdRef.current !== null) expandCluster(null);
+      // Empty space → step back out of any focus, in one go.
+      if (selectedIdRef.current || expandedIdRef.current !== null) zoomOut();
     };
 
     canvas.addEventListener("mousemove", onMouseMove);
@@ -861,7 +872,7 @@ export function Terrain() {
       canvas.removeEventListener("mouseleave", onMouseLeave);
       canvas.removeEventListener("click", onClick);
     };
-  }, [selectNode, expandCluster]);
+  }, [selectNode, expandCluster, zoomOut]);
 
   return (
     <div ref={containerRef} className="absolute inset-0">

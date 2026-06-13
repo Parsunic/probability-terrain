@@ -33,7 +33,8 @@ const DEBOUNCE_MS = 450;
 function parseNavCommand(raw: string): { type: "goto"; target: string } | { type: "out" } | null {
   const s = raw.trim().toLowerCase();
   if (/^(?:zoom out|back out|go back|step back|take me back|reset|home|exit)\b/.test(s)) return { type: "out" };
-  const m = s.match(/^(?:take me to|go to|navigate to|show me|fly to|jump to|open|expand)\s+(.+)/);
+  // Only unambiguous navigation verbs (no "open"/"expand" — those read as searches).
+  const m = s.match(/^(?:take me to|go to|navigate to|show me|fly to|jump to)\s+(.+)/);
   if (m) {
     const target = m[1].replace(/\b(?:the|island|cluster|topic|notes?|please)\b/g, "").trim();
     if (target.length >= 2) return { type: "goto", target };
@@ -63,20 +64,31 @@ export function SearchBar() {
   const warming = !modelReady && !usingGemini;
 
   const scheduleSearch = useCallback(
-    (value: string) => {
+    (value: string, isFinal = true) => {
       if (debounceRef.current) window.clearTimeout(debounceRef.current);
       debounceRef.current = window.setTimeout(() => {
-        const cmd = parseNavCommand(value);
-        if (cmd) {
-          if (cmd.type === "out") {
-            zoomOut();
-            setText(""); // a command isn't a lingering query
-            return;
-          }
-          // "take me to X" — fly to a matching island; fall back to search if none.
-          if (focusClusterByName(cmd.target)) {
-            setText("");
-            return;
+        // Only act on commands for a final result — a mid-utterance voice pause
+        // shouldn't fly to an island on an incomplete phrase. Interim transcripts
+        // still drive live search ("fog clearing") below.
+        if (isFinal) {
+          const cmd = parseNavCommand(value);
+          if (cmd) {
+            if (cmd.type === "out") {
+              zoomOut();
+              setText(""); // a command isn't a lingering query
+              return;
+            }
+            if (focusClusterByName(cmd.target)) {
+              setText("");
+              return;
+            }
+            // Navigation verb but no matching island → search the stripped target,
+            // not the verb-laden phrase.
+            if (cmd.target.trim()) {
+              setText(cmd.target);
+              runSearch(cmd.target);
+              return;
+            }
           }
         }
         if (value.trim()) runSearch(value);
@@ -132,7 +144,8 @@ export function SearchBar() {
         transcript += e.results[i][0].transcript;
       }
       setText(transcript);
-      scheduleSearch(transcript);
+      const last = e.results[e.results.length - 1];
+      scheduleSearch(transcript, last ? last.isFinal : true);
     };
 
     recognition.onend = () => setIsListening(false);
