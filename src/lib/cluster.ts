@@ -47,6 +47,13 @@ const STOPWORDS = new Set([
   "couldn't", "wouldn't", "shouldn't", "hasn't", "haven't", "hadn't", "i'm", "i've", "i'd",
   "i'll", "you're", "you've", "you'll", "we're", "we've", "we'll", "they're", "they've",
   "that's", "there's", "here's", "what's", "let's", "who's", "it'll", "you'd", "they'd",
+  // generic verbs & imperatives that win keyword scoring without meaning anything
+  "stop", "whatever", "else", "said", "say", "says", "saying", "keep", "keeps", "kept",
+  "tell", "told", "tells", "want", "wants", "wanted", "give", "gives", "gave", "take",
+  "takes", "took", "look", "looks", "looked", "feel", "feels", "felt", "goes", "going",
+  "gone", "comes", "came", "think", "thinks", "thought", "puts", "use", "uses", "used",
+  "find", "finds", "found", "start", "starts", "started", "leave", "leaves", "everyone",
+  "wrote", "writes", "else's", "people", "person", "someone's", "everything's", "nobody",
 ]);
 
 function tokenize(text: string): string[] {
